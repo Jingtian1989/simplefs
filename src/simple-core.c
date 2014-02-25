@@ -1,219 +1,224 @@
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/errno.h>
 #include <linux/fs.h>
-#include <linux/stat.h>
+#include <linux/backing-dev.h>
+#include <linux/pagemap.h>
 #include <linux/dcache.h>
-#include <linux/gfp.h>
 #include <linux/mm.h>
-#include <asm/uaccess.h>
 
-
-struct file_contents {
-	struct list_head list;
-	struct inode *inode;
-	void *conts;
-};
+static int simplefs_create (struct inode *dir, struct dentry *dentry, umode_t mode, struct nameidata *data);
+static int simplefs_symlink (struct inode * dir, struct dentry *dentry, const char * symname);
+static int simplefs_mkdir (struct inode * dir, struct dentry * dentry, umode_t mode);
+static int simplefs_mknod (struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev);
+static int set_page_dirty_no_writeback(struct page *page);
 
 static int inode_number = 0;
-static LIST_HEAD(contents_list);
+
+static struct backing_dev_info simplefs_backing_dev_info = {
+
+	.name 			= "simplefs",
+	.ra_pages		= 0,	/*	no readahead	*/
+	.capabilities	= BDI_CAP_NO_ACCT_AND_WRITEBACK | /*	no writeback, no dirty page account*/
+					  BDI_CAP_MAP_DIRECT |	/*	support direct map */
+					  BDI_CAP_MAP_COPY |	/*	support copy map */
+					  BDI_CAP_READ_MAP | 	/*	support map read */
+					  BDI_CAP_WRITE_MAP | 	/*	support map write */
+					  BDI_CAP_EXEC_MAP 		/*	support map execute code */
+};
+
+static struct address_space_operations simplefs_aops = {
+	.readpage 		=	simple_readpage,
+	.write_begin 	=	simple_write_begin,
+	.write_end 		=	simple_write_end,
+	.set_page_dirty = 	set_page_dirty_no_writeback,
+};
+
+static struct file_operations simplefs_file_operations = {
+	.read 			=	do_sync_read,
+	.aio_read 		= 	generic_file_aio_read,
+	.write 			= 	do_sync_write,
+	.aio_write		=	generic_file_aio_write,
+	.mmap 			=	generic_file_mmap,
+	.fsync 			=	noop_fsync,
+	.splice_read	=	generic_file_splice_read,
+	.splice_write 	=	generic_file_splice_write,
+	.llseek 		= 	generic_file_llseek,
+};
+
+static struct inode_operations simplefs_file_inode_operations = {
+	.setattr 		=	simple_setattr,
+	.getattr 		=	simple_getattr,
+};
+
+static struct inode_operations simplefs_dir_inode_operations = {
+	.create 		=	simplefs_create,
+	.lookup 		=	simple_lookup,
+	.link 			=	simple_link,
+	.unlink 		=	simple_unlink,
+	.symlink 		=	simplefs_symlink,
+	.mkdir 			=	simplefs_mkdir,
+	.rmdir 			=	simple_rmdir,
+	.mknod 			=	simplefs_mknod,
+	.rename 		=	simple_rename,
+};
 
 
-static struct file_contents *simplefs_find_file(struct inode *inode)
+static struct super_operations simplefs_ops = {
+	.statfs 		=	simple_statfs,
+	.drop_inode 	= 	generic_delete_inode,
+	.show_options 	=	generic_show_options,
+};
+
+
+static int set_page_dirty_no_writeback(struct page *page)  
+{  
+    if (!PageDirty(page))  
+        return !TestSetPageDirty(page);  
+    return 0;  
+}  
+
+static struct inode *simplefs_get_inode (struct super_block *sb, const struct inode *dir, umode_t mode, dev_t dev)
 {
-	struct file_contents *file_conts;
-	list_for_each_entry(file_conts, &contents_list, list)
+	struct inode *inode = new_inode(sb);
+
+	if (inode)
 	{
-		if (file_conts->inode == inode)
-			return file_conts;
+		inode->i_ino 	= ++inode_number;
+		/*	init uid, gid, mode for new inode according to posix standards */
+		inode_init_owner(inode, dir, mode);
+		inode->i_mapping->a_ops = &simplefs_aops;
+		inode->i_mapping->backing_dev_info = &simplefs_backing_dev_info;
+		mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
+		mapping_set_unevictable(inode->i_mapping);
+		inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
+		switch (mode & S_IFMT)
+		{
+			case S_IFREG:
+				inode->i_op  = &simplefs_file_inode_operations;
+				inode->i_fop = &simplefs_file_operations;
+				break;
+			case S_IFDIR:
+				inode->i_op  = &simplefs_dir_inode_operations;
+				inode->i_fop = &simple_dir_operations;
+				/*	directory inodes start off with i_nlink == 2 (for "." entry) */
+				inc_nlink(inode);
+				break;
+			case S_IFLNK:
+				inode->i_op  = &page_symlink_inode_operations;
+				break;
+			default:
+				init_special_inode(inode, mode, dev);
+				break;
+		}	
 	}
-	return NULL;
+
+	return inode;
 }
 
-ssize_t simplefs_read (struct file *file, char __user *buf, size_t count, loff_t *pos)
+static int simplefs_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev)
 {
-	struct file_contents *file_conts;
-	struct inode *inode file->f_path.dentry->d_inode;
-	unsigned int size = count;
+	struct inode * inode = simplefs_get_inode(dir->i_sb, dir, mode, dev);
+	int error = -ENOSPC;
 
-	file_conts = simplefs_find_file(inode);
-	if (file_conts == NULL)
-		return -EIO;
-
-	if (file_conts->inode->i_size < count)
-		size = file_conts->inode->i_size;
-
-	if ((*pos + size) >= file_conts->inode->i_size)
-		size = file_conts->inode->i_size - *pos;
-
-	if (copy_to_user(buf, file_conts->conts + *pos, size))
-		return -EFAULT;
-
-	return size;
+	if (inode) {
+		d_instantiate(dentry, inode);
+		dget(dentry);	
+		error = 0;
+		dir->i_mtime = dir->i_ctime = CURRENT_TIME;
+	}
+	return error;
 }
 
-ssize_t simplefs_write (struct file *file, const char __user *buf, size_t count, loff_t *pos)
+
+static int simplefs_create(struct inode *dir, struct dentry *dentry, umode_t mode, struct nameidata *nd)
 {
-	struct file_contents *file_conts;
-	struct inode *inode = file->f_path.dentry->d_inode;
-
-	file_conts = simplefs_find_file(inode);
-	if (file_conts == NULL)
-		return -ENOENT;
-
-	if (copy_from_user(file_conts->conts + *pos, buf, count))
-		return -EFAULT;
-
-	return count;
+	return simplefs_mknod(dir, dentry, mode | S_IFREG, 0);
 }
 
-static int simplefs_open (struct inode *inode, struct file *file)
-{
-	if (inode->i_private)
-		file->private_data = inode->i_private;
-	return 0;
-}
-
-static const struct file_operations simplefs_file_operations = {
-	.read  = simplefs_read,
-	.write = simplefs_write,
-	.open  = simplefs_open, 
-};
-static const struct inode_operations simplefs_file_inode_operations = {
-	.getattr 	=	simple_getattr,
-};
-
-static int simple_fs_create (struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
+static int simplefs_symlink(struct inode * dir, struct dentry *dentry, const char * symname)
 {
 	struct inode *inode;
-	struct file_contents *file;
-	struct page *page;
+	int error = -ENOSPC;
 
-	inode = new_inode(dir->i_sb);
-	inode->i_blocks = 0;
-	inode->i_ino 	= ++inode_number;
-	switch (mode & S_IFMT)
-	{
-
-		case S_IFDIR:
-			inode->i_mode = mode;
-			inode->i_op   = &simplefs_dir_inode_operations;
-			inode->f_fop  = &simple_dir_operations;
-			/*	directorios term nlink=2*/
-			inc_nlink(inode);	
-			break;
-		default:
-			inode->i_mode = mode | S_IFREG;
-			file = kmalloc(sizeof(*file), GFP_KERNEL);
-			if (!file)
-				return -EAGAIN;
-			inode->i_blocks = 0;
-			inode->i_op 	= &simplefs_file_inode_operations;
-			inode->i_fop 	= &simplefs_file_operations;
-			file->inode = inode;
-			page = alloc_page(GFP_KERNEL);
-			if (!page)
-				goto err_alloc_page;
-			file->conts = page_address(page);
-			INIT_LIST_HEAD(&file->list);
-			list_add_tail(&file->list, &contents_list);
-			break;
+	inode = simplefs_get_inode(dir->i_sb, dir, S_IFLNK|S_IRWXUGO, 0);
+	if (inode) {
+		int l = strlen(symname)+1;
+		error = page_symlink(inode, symname, l);
+		if (!error) {
+			d_instantiate(dentry, inode);
+			dget(dentry);
+			dir->i_mtime = dir->i_ctime = CURRENT_TIME;
+		} else
+			iput(inode);
 	}
-	/*	fill in inode information for a dentry */
-	d_instantiate(dentry, inode);
-	dget(dentry);
-	return 0;
-
-err_alloc_page:
-	iput(inode);
-	kfree(file);
-	return -EINVAL;
+	return error;
 }
 
-static int simple_fs_mkdir (struct inode *dir, struct dentry *dentry, umode_t mode)
+static int simplefs_mkdir(struct inode * dir, struct dentry * dentry, umode_t mode)
 {
-	int res;
-	/*	only keep IRWXUGO and ISVTX for directory */
-	mode = (mode & (S_IRWXUGO | S_ISVTX)) | S_IFDIR;
-	res = simple_fs_create(dir, dentry, mode, 0);
-	if (!res)
-	{
-		fsnotify_mkdir(dir, dentry);
-	}
-	return res;
+	int retval = simplefs_mknod(dir, dentry, mode | S_IFDIR, 0);
+	if (!retval)
+		inc_nlink(dir);
+	return retval;
 }
 
-static const struct inode_operations simplefs_dir_inode_operations = {
-	.create 	=	simple_fs_create,
-	.lookup 	= 	simple_lookup,
-	.mkdir 		= 	simple_fs_mkdir,
-	.rename 	= 	simple_rename,
-	.rmdir 		= 	simple_rmdir,
-};
 
-static int simple_fill_super (struct super_block *sb, void *data, int silent)
+static int simplefs_fill_super (struct super_block *sb, void *data, int silent)
 {
+	struct inode *inode;
 
-	struct inode  *inode;
-	struct dentry *root;
+	sb->s_maxbytes 			= MAX_LFS_FILESIZE;
+	sb->s_blocksize			= PAGE_CACHE_SIZE;
+	sb->s_blocksize_bits	= PAGE_CACHE_SHIFT;
+	sb->s_magic 			= 0xabcdef;
+	sb->s_op 				= &simplefs_ops;
+	sb->s_time_gran 		= 1;
 
-	sb->s_magic 	= 0xabcdef;
-	sb->s_op 		= &simplefs_ops;
-	/* granularity of c/m/atime in ns. */
-	sb->s_time_gran = 1;
-
-	inode = new_inode(sb);
-	if (!inode)
+	inode = simplefs_get_inode(sb, NULL, S_IFDIR, 0);
+	sb->s_root = d_make_root(inode);
+	if (!sb->s_root)
 		return -ENOMEM;
 
-	inode->i_ino = ++inode_number;
-	/*	data block counts */
-	inode->i_blocks = 0;
-	inode->i_mode 	= S_IFDIR | S_IRUGO | S_IXUGO | S_IWUSR;
-	inode->i_op   	= &simplefs_dir_inode_operations;
-	inode->f_op 	= &simple_dir_operations;
-	root = d_make_root(inode);
-	if (!root)
-	{
-		iput(inode);
-		return -ENOMEM;
-	}	 
-	sb->s_root = root;
 	return 0;
 }
 
 
-static struct dentry *simple_get_sb (struct file_system_type *fs_type, int flags, const char *dev_name, void *data)
+static struct dentry *simplefs_mount (struct file_system_type *fs_type, int flags, const char *dev_name, void *data)
 {
-	return mount_bdev(fs_type, flags, dev_name, data, simple_fill_super);
+	return mount_nodev(fs_type, flags, data, simplefs_fill_super);
 }
 
-static struct file_system_type simple_fs_type = {
-	.owner 		= THIS_MODULE,
-	.name  		= "simplefs",
-	.mount 		= simple_get_sb,
+
+
+static struct file_system_type simplefs_type = {
+	.name 		= "simplefs",
+	.mount 		= simplefs_mount,
 	.kill_sb	= kill_litter_super,
 };
 
 
-static int __init init_simple_fs(void)
-{
-	INIT_LIST_HEAD(&contents_list);
-	return register_filesystem(&simple_fs);
-}
 
-static void __exit exit_simple_fs(void)
+static int init_simplefs(void)
 {
-	struct file_contents *file_conts;
-	list_for_each_entry(file_conts, &contents_list, list)
-	{
-		free_page((unsigned int) f->conts);
-		kfree(file_conts);
-	}
-	unregister_filesystem(&simple_fs_type);
+	int err;
+
+	err = bdi_init(&simplefs_backing_dev_info);
+	if (err)
+		return err;
+	err = register_filesystem(&simplefs_type);
+	if (err)
+		bdi_destroy(&simplefs_backing_dev_info);
+	return err;
 }
 
 
-module_init(init_simple_fs);
-module_exit(exit_simple_fs);
+static void exit_simplefs(void)
+{
+	unregister_filesystem(&simplefs_type);
+	bdi_destroy(&simplefs_backing_dev_info);
+	return;
+}
+
+module_init(init_simplefs);
+module_exit(exit_simplefs);
 MODULE_LICENSE("GPL");
